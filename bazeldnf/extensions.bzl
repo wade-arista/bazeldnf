@@ -90,7 +90,7 @@ update_lock_file(
     repofile = "{repofile}",
     nobest = {nobest},
     cache_dir = {cache_dir},
-    architecture = "{architecture}",
+    architectures = {architectures},
     visibility = ["//visibility:public"],
 )
 """
@@ -119,7 +119,7 @@ def _alias_repository_impl(repository_ctx):
             excludes = ", ".join(["'{}'".format(x) for x in repository_ctx.attr.excludes]),
             repofile = repofile,
             nobest = "True" if repository_ctx.attr.nobest else "False",
-            architecture = repository_ctx.attr.architecture,
+            architectures = repr(repository_ctx.attr.architectures),
         ),
     )
     for rpm in repository_ctx.attr.rpms:
@@ -157,13 +157,19 @@ _alias_repository = repository_rule(
         "repository_prefix": attr.string(),
         "nobest": attr.bool(default = False),
         "cache_dir": attr.string(),
-        "architecture": attr.string(values = ["i686", "x86_64", "aarch64", ""]),
+        "architectures": attr.string_list(),
     },
 )
 
 def _to_rpm_repo_name(prefix, rpm_name):
     name = rpm_name.replace("+", "plus")
     return "{}{}".format(prefix, name)
+
+def _get_architectures(architecture, architectures):
+    """ Create effective list of architectures based on user input """
+    if architecture and architectures:
+        fail("Can't combine `architecture` and `architectures`")
+    return architectures or [(architecture or "x86_64")]
 
 def _handle_lock_file(config, module_ctx, registered_rpms = {}):
     if not config.lock_file:
@@ -177,7 +183,7 @@ def _handle_lock_file(config, module_ctx, registered_rpms = {}):
         "repofile": config.repofile,
         "repository_prefix": config.rpm_repository_prefix,
         "nobest": config.nobest,
-        "architecture": config.architecture,
+        "architectures": _get_architectures(config.architecture, config.architectures),
     }
 
     module_ctx.watch(config.lock_file)
@@ -185,56 +191,26 @@ def _handle_lock_file(config, module_ctx, registered_rpms = {}):
     if config.cache_dir:
         repository_args["cache_dir"] = config.cache_dir
 
-    if not module_ctx.path(config.lock_file).exists:
-        _alias_repository(
-            **repository_args
-        )
-        return config.name
+    # List of repositories & aliases we want to have created, even if they didn't resolve to existing RPMs
+    ensure_rpm_repository = {}
 
-    content = module_ctx.read(config.lock_file)
-    lock_file_json = json.decode(content)
+    if module_ctx.path(config.lock_file).exists:
+        content = module_ctx.read(config.lock_file)
+        lock_file_json = json.decode(content)
 
-    for rpm in lock_file_json.get("rpms", []):
-        dependencies = rpm.pop("dependencies", [])
-        if config.ignore_deps:
-            dependencies = []
-        else:
-            dependencies = [x.replace("+", "plus") for x in dependencies]
-            dependencies = ["@{}{}//rpm".format(config.rpm_repository_prefix, x) for x in dependencies]
+        for rpm in lock_file_json.get("rpms", []):
+            _add_rpm_repository(config, rpm, lock_file_json, registered_rpms)
 
-        rpm_name = rpm.pop("name", None)
-        if not rpm_name:
-            urls = rpm.get("urls", [])
-            if len(urls) < 1:
-                fail("invalid entry in %s for %s" % (config.lock_file, rpm_name))
-            rpm_name = urls[0].rsplit("/", 1)[-1]
+        # if there's targets without matching RPMs we need to create a null target
+        # so that consumers have something consistent that they can depend on
+        for target in lock_file_json.get("targets", []):
+            ensure_rpm_repository[target] = True
+    elif config.ignore_missing_lockfile:
+        for target in config.rpms:
+            ensure_rpm_repository[target] = True
 
-        name = _to_rpm_repo_name(config.rpm_repository_prefix, rpm_name)
-        if name in registered_rpms:
-            continue
-        registered_rpms[name] = 1
-        repository = rpm.pop("repository")
-        mirrors = lock_file_json.get("repositories", {}).get(repository, None)
-        if mirrors == None:
-            fail("couldn't resolve %s in %s" % (repository, lock_file_json["repositories"]))
-        href = rpm.pop("urls")[0]
-        urls = ["%s/%s" % (x, href) for x in mirrors]
-        rpm_repository(
-            name = name,
-            dependencies = dependencies,
-            urls = urls,
-            **rpm
-        )
-
-    # if there's targets without matching RPMs we need to create a null target
-    # so that consumers have something consistent that they can depend on
-    for target in lock_file_json.get("targets", []):
-        name = _to_rpm_repo_name(config.rpm_repository_prefix, target)
-        if name in registered_rpms:
-            continue
-
-        null_rpm_repository(name = name)
-        registered_rpms[name] = 1
+    for target in ensure_rpm_repository:
+        _add_null_rpm_repository(config, target, registered_rpms)
 
     repository_args["rpms"] = ["@@%s//rpm" % x for x in registered_rpms.keys()]
 
@@ -243,6 +219,48 @@ def _handle_lock_file(config, module_ctx, registered_rpms = {}):
     )
 
     return config.name
+
+def _add_rpm_repository(config, rpm, lock_file_json, registered_rpms):
+    dependencies = rpm.pop("dependencies", [])
+    if config.ignore_deps:
+        dependencies = []
+    else:
+        dependencies = [x.replace("+", "plus") for x in dependencies]
+        dependencies = ["@{}{}//rpm".format(config.rpm_repository_prefix, x) for x in dependencies]
+
+    rpm_name = rpm.pop("name", None)
+    if not rpm_name:
+        urls = rpm.get("urls", [])
+        if len(urls) < 1:
+            fail("invalid entry in %s for %s" % (config.lock_file, rpm_name))
+        rpm_name = urls[0].rsplit("/", 1)[-1]
+
+    name = _to_rpm_repo_name(config.rpm_repository_prefix, rpm_name)
+    if name in registered_rpms:
+        return False
+    registered_rpms[name] = 1
+    repository = rpm.pop("repository")
+    mirrors = lock_file_json.get("repositories", {}).get(repository, None)
+    if mirrors == None:
+        fail("couldn't resolve %s in %s" % (repository, lock_file_json["repositories"]))
+    href = rpm.pop("urls")[0]
+    urls = ["%s/%s" % (x, href) for x in mirrors]
+    rpm_repository(
+        name = name,
+        dependencies = dependencies,
+        urls = urls,
+        **rpm
+    )
+    return True
+
+def _add_null_rpm_repository(config, target, registered_rpms):
+    name = _to_rpm_repo_name(config.rpm_repository_prefix, target)
+    if name in registered_rpms:
+        return False
+
+    null_rpm_repository(name = name)
+    registered_rpms[name] = 1
+    return True
 
 def _bazeldnf_extension(module_ctx):
     # make sure all our dependencies are registered as those may be needed when those
@@ -369,6 +387,12 @@ The lock file content is as:
 """,
             allow_single_file = [".json"],
         ),
+        "ignore_missing_lockfile": attr.bool(
+            doc = """In case lockfile does not exist, create null rpm targets so that clients can still depend on them.
+
+            One won't be prompted with "please run `bazel run @{repo}//:update-lock-file` first".""",
+            default = False,
+        ),
         "rpm_repository_prefix": attr.string(
             doc = "A prefix to add to all generated rpm repositories",
             default = "",
@@ -392,8 +416,14 @@ The lock file content is as:
             default = False,
         ),
         "architecture": attr.string(
-            doc = "Architectures to enable in addition to noarch",
-            values = ["i686", "x86_64", "aarch64", ""],
+            doc = "Single architecture to enable in addition to noarch",
+        ),
+        "architectures": attr.string_list(
+            doc = """Custom list of architectures (can't be used with `architecture`).
+
+                Can use more than one. The list defines architectures priority –
+                with the first one having the highest priority.
+                `noarch` is implicitly added at the end (if not present on the list).""",
         ),
     },
 )
